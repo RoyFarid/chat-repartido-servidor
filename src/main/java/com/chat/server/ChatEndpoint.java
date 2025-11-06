@@ -10,12 +10,36 @@ import java.util.HashSet;
 import java.util.Set;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
+import jakarta.websocket.SendHandler;
+import jakarta.websocket.SendResult;
 
 @ServerEndpoint("/chat")
 public class ChatEndpoint {
 
     private static final Set<Session> sesiones =
             Collections.synchronizedSet(new HashSet<>());
+
+    // Executor for background tasks (pdf worker, etc.). Size configurable with -Dchat.worker.pool.size=N
+    private static final int WORKER_POOL_SIZE = Integer.getInteger("chat.worker.pool.size", 4);
+    private static final ExecutorService WORKER_POOL = Executors.newFixedThreadPool(WORKER_POOL_SIZE);
+
+    static {
+        // Shutdown executor gracefully on JVM exit
+        Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+            WORKER_POOL.shutdown();
+            try {
+                if (!WORKER_POOL.awaitTermination(3, TimeUnit.SECONDS)) {
+                    WORKER_POOL.shutdownNow();
+                }
+            } catch (InterruptedException e) {
+                WORKER_POOL.shutdownNow();
+                Thread.currentThread().interrupt();
+            }
+        }, "chat-endpoint-shutdown"));
+    }
 
     @OnOpen
     public void onOpen(Session session) {
@@ -65,8 +89,8 @@ public class ChatEndpoint {
                 notify.put("event", "pdf_creating");
                 notify.put("title", title);
                 broadcast(notify.toString());
-                // lanzar trabajo simulado en otro hilo
-                new Thread(() -> {
+                // lanzar trabajo simulado en el pool para no bloquear
+                WORKER_POOL.submit(() -> {
                     try {
                         Thread.sleep(3000);
                         System.out.printf("PDF listo (simulado): %s%n", title);
@@ -78,7 +102,7 @@ public class ChatEndpoint {
                     } catch (InterruptedException e) {
                         Thread.currentThread().interrupt();
                     }
-                }, "pdf-worker").start();
+                });
             }
         } catch (Exception e) {
             System.out.println("Error procesando mensaje: " + e.getMessage());
@@ -102,9 +126,24 @@ public class ChatEndpoint {
             for (Session s : sesiones) {
                 if (s.isOpen()) {
                     try {
-                        s.getBasicRemote().sendText(mensaje);
-                    } catch (IOException e) {
-                        System.err.println("Error enviando mensaje a cliente: " + e.getMessage());
+                        // enviar de forma asíncrona para evitar bloqueos del servidor
+                        // añadimos un SendHandler para detectar fallos y limpiar la sesión si es necesario
+                        s.getAsyncRemote().sendText(mensaje, new SendHandler() {
+                            @Override
+                            public void onResult(SendResult result) {
+                                if (result.getException() != null) {
+                                    System.err.println("Error enviando mensaje a cliente (async): " + result.getException().getMessage());
+                                    try {
+                                        sesiones.remove(s);
+                                        s.close();
+                                    } catch (Exception ex) {
+                                        // ignore
+                                    }
+                                }
+                            }
+                        });
+                    } catch (Exception e) {
+                        System.err.println("Error iniciando envío async a cliente: " + e.getMessage());
                         toRemove.add(s);
                     }
                 } else {
