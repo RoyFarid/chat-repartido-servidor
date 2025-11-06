@@ -5,6 +5,7 @@ import jakarta.websocket.server.ServerEndpoint;
 import org.json.JSONObject;
 
 import java.io.IOException;
+import java.io.FileOutputStream;
 import java.util.Collections;
 import java.util.HashSet;
 import java.util.Set;
@@ -15,6 +16,13 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import jakarta.websocket.SendHandler;
 import jakarta.websocket.SendResult;
+import java.nio.ByteBuffer;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicReference;
 
 @ServerEndpoint("/chat")
 public class ChatEndpoint {
@@ -25,6 +33,39 @@ public class ChatEndpoint {
     // Executor for background tasks (pdf worker, etc.). Size configurable with -Dchat.worker.pool.size=N
     private static final int WORKER_POOL_SIZE = Integer.getInteger("chat.worker.pool.size", 4);
     private static final ExecutorService WORKER_POOL = Executors.newFixedThreadPool(WORKER_POOL_SIZE);
+
+    // Uploads in progress: fileId -> state
+    private static final Map<String, UploadState> uploads = new ConcurrentHashMap<>();
+    // For each session, which fileId we expect next as a binary chunk (set by upload_chunk_meta)
+    private static final Map<Session, AtomicReference<String>> pendingBinary = new ConcurrentHashMap<>();
+
+    private static class UploadState {
+        final Path tmpPath;
+        final FileOutputStream os;
+        final long expectedSize;
+        long received = 0;
+        final String name;
+
+        UploadState(Path tmpPath, FileOutputStream os, long expectedSize, String name) {
+            this.tmpPath = tmpPath;
+            this.os = os;
+            this.expectedSize = expectedSize;
+            this.name = name;
+        }
+
+        synchronized void write(ByteBuffer buf) throws IOException {
+            int len = buf.remaining();
+            byte[] b = new byte[len];
+            buf.get(b);
+            os.write(b);
+            received += len;
+        }
+
+        synchronized void close() throws IOException {
+            os.flush();
+            os.close();
+        }
+    }
 
     static {
         // Shutdown executor gracefully on JVM exit
@@ -44,6 +85,8 @@ public class ChatEndpoint {
     @OnOpen
     public void onOpen(Session session) {
         sesiones.add(session);
+        // preparar estructura para recibir binarios (metadata + binary alternado)
+        pendingBinary.put(session, new AtomicReference<>(null));
         System.out.println("Cliente conectado. Total: " + sesiones.size());
     }
 
@@ -52,6 +95,34 @@ public class ChatEndpoint {
         try {
             JSONObject data = new JSONObject(mensaje);
             String tipo = data.optString("type", "");
+            if ("upload_start".equals(tipo)) {
+                String fileId = data.optString("fileId", "");
+                String name = data.optString("name", "uploaded.bin");
+                long size = data.optLong("size", -1);
+                try {
+                    Path tmp = Files.createTempFile("upload-", "-" + name);
+                    FileOutputStream os = new FileOutputStream(tmp.toFile());
+                    UploadState st = new UploadState(tmp, os, size, name);
+                    uploads.put(fileId, st);
+                    System.out.printf("Iniciada subida: %s (fileId=%s, expected=%d) -> %s%n", name, fileId, size, tmp.toString());
+                    JSONObject started = new JSONObject();
+                    started.put("type", "system");
+                    started.put("event", "upload_started");
+                    started.put("fileId", fileId);
+                    started.put("file", name);
+                    broadcast(started.toString());
+                } catch (IOException e) {
+                    System.err.println("No se pudo iniciar upload: " + e.getMessage());
+                }
+                return;
+            } else if ("upload_chunk_meta".equals(tipo)) {
+                String fileId = data.optString("fileId", "");
+                AtomicReference<String> ref = pendingBinary.get(session);
+                if (ref != null) {
+                    ref.set(fileId);
+                }
+                return;
+            }
             if ("chat".equals(tipo)) {
                 String user = data.optString("user", "Anon");
                 String text = data.optString("text", "");
@@ -73,13 +144,32 @@ public class ChatEndpoint {
                 sys.put("part", part);
                 broadcast(sys.toString());
             } else if ("upload_end".equals(tipo)) {
-                String name = data.optString("name", "unknown");
-                System.out.printf("Subida terminada (simulada) del archivo %s%n", name);
-                JSONObject done = new JSONObject();
-                done.put("type", "system");
-                done.put("event", "upload_done");
-                done.put("file", name);
-                broadcast(done.toString());
+                String fileId = data.optString("fileId", "");
+                if (!fileId.isEmpty()) {
+                    UploadState st = uploads.remove(fileId);
+                    if (st != null) {
+                        try {
+                            st.close();
+                            System.out.printf("Subida terminada (real) del archivo %s -> %s (recibidos=%d)%n", st.name, st.tmpPath.toString(), st.received);
+                            JSONObject done = new JSONObject();
+                            done.put("type", "system");
+                            done.put("event", "upload_done");
+                            done.put("file", st.name);
+                            done.put("path", st.tmpPath.toString());
+                            broadcast(done.toString());
+                        } catch (IOException e) {
+                            System.err.println("Error cerrando upload: " + e.getMessage());
+                        }
+                    }
+                } else {
+                    String name = data.optString("name", "unknown");
+                    System.out.printf("Subida terminada (simulado) del archivo %s%n", name);
+                    JSONObject done = new JSONObject();
+                    done.put("type", "system");
+                    done.put("event", "upload_done");
+                    done.put("file", name);
+                    broadcast(done.toString());
+                }
             } else if ("create_pdf".equals(tipo)) {
                 String title = data.optString("title", "Sin título");
                 System.out.printf("Solicitud de creación de PDF: %s (simulado)%n", title);
@@ -106,6 +196,34 @@ public class ChatEndpoint {
             }
         } catch (Exception e) {
             System.out.println("Error procesando mensaje: " + e.getMessage());
+        }
+    }
+
+    @OnMessage
+    public void onBinaryMessage(ByteBuffer data, Session session) {
+        AtomicReference<String> ref = pendingBinary.get(session);
+        String fileId = null;
+        if (ref != null) fileId = ref.getAndSet(null);
+        if (fileId == null) {
+            System.out.println("Binary message received but no pending fileId for session");
+            return;
+        }
+        UploadState st = uploads.get(fileId);
+        if (st == null) {
+            System.out.println("No upload state for fileId=" + fileId);
+            return;
+        }
+        try {
+            st.write(data);
+            // optionally inform progress
+            JSONObject prog = new JSONObject();
+            prog.put("type", "system");
+            prog.put("event", "upload_receiving");
+            prog.put("file", st.name);
+            prog.put("received", st.received);
+            broadcast(prog.toString());
+        } catch (IOException e) {
+            System.err.println("Error escribiendo chunk para fileId=" + fileId + ": " + e.getMessage());
         }
     }
 

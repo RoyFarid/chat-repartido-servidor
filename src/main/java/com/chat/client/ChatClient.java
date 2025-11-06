@@ -10,8 +10,12 @@ import jakarta.websocket.WebSocketContainer;
 import org.json.JSONObject;
 
 import java.io.BufferedReader;
+import java.io.File;
+import java.io.FileInputStream;
 import java.io.IOException;
 import java.io.InputStreamReader;
+import java.nio.ByteBuffer;
+import java.util.UUID;
 import java.net.URI;
 import java.util.concurrent.atomic.AtomicReference;
 
@@ -98,7 +102,7 @@ public class ChatClient {
             sess.getAsyncRemote().sendText(join.toString());
         }
 
-        System.out.println("Comandos: /say texto | /upload nombre.ext | /pdf Titulo | /quit");
+    System.out.println("Comandos: /say texto | /upload nombre.ext (simulado) | /uploadfile ruta/a/archivo | /pdf Titulo | /quit");
         while (true) {
             String line = reader.readLine();
             if (line == null) break;
@@ -142,6 +146,52 @@ public class ChatClient {
                     }
                 }, "upload-worker").start();
                 System.out.println("Subida simulada iniciada para: " + name);
+            } else if (line.startsWith("/uploadfile ")) {
+                String ruta = line.substring(12).trim();
+                File f = new File(ruta);
+                if (!f.exists() || !f.isFile()) {
+                    System.out.println("Archivo no encontrado: " + ruta);
+                    continue;
+                }
+                String fileId = UUID.randomUUID().toString();
+                String filename = f.getName();
+                long size = f.length();
+                // enviar upload_start
+                JSONObject start = new JSONObject();
+                start.put("type", "upload_start");
+                start.put("fileId", fileId);
+                start.put("name", filename);
+                start.put("size", size);
+                Session ss0 = sessionRef.get();
+                if (ss0 != null && ss0.isOpen()) ss0.getAsyncRemote().sendText(start.toString());
+
+                // enviar en hilo los chunks binarios
+                new Thread(() -> {
+                    try (FileInputStream fis = new FileInputStream(f)) {
+                        byte[] buf = new byte[64 * 1024];
+                        int r;
+                        while ((r = fis.read(buf)) > 0) {
+                            JSONObject meta = new JSONObject();
+                            meta.put("type", "upload_chunk_meta");
+                            meta.put("fileId", fileId);
+                            meta.put("len", r);
+                            Session ss = sessionRef.get();
+                            if (ss == null || !ss.isOpen()) break;
+                            ss.getAsyncRemote().sendText(meta.toString());
+                            ss.getAsyncRemote().sendBinary(ByteBuffer.wrap(buf, 0, r));
+                            Thread.sleep(50);
+                        }
+                        JSONObject end = new JSONObject();
+                        end.put("type", "upload_end");
+                        end.put("fileId", fileId);
+                        Session ss = sessionRef.get();
+                        if (ss != null && ss.isOpen()) ss.getAsyncRemote().sendText(end.toString());
+                        System.out.println("Subida de archivo terminada: " + ruta);
+                    } catch (Exception e) {
+                        System.err.println("Error subiendo archivo: " + e.getMessage());
+                    }
+                }, "uploadfile-worker").start();
+                System.out.println("Subida de archivo iniciada (binario) para: " + ruta);
             } else if (line.startsWith("/pdf ")) {
                 String title = line.substring(5).trim();
                 if (title.isEmpty()) {
@@ -166,6 +216,7 @@ public class ChatClient {
                 System.out.println("Comando desconocido. Usa /say, /upload, /pdf o /quit");
             }
         }
+
 
         System.out.println("Cliente terminando");
         System.exit(0);
